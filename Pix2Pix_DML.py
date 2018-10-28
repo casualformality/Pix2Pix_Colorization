@@ -271,10 +271,10 @@ if __name__ == "__main__":
     filter_depth = 12
     num_layers = 2
     """
-    cond_img_shape = (128, 128, 1)
-    targ_img_shape = (128, 128, 2)
+    cond_img_shape = (256, 256, 1)
+    targ_img_shape = (256, 256, 2)
     filter_depth = 64
-    num_layers = 6
+    num_layers = 7
     num_epochs = 200
     batch_size = 10
 
