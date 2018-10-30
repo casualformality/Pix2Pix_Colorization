@@ -3,9 +3,10 @@ import numpy as np
 import os
 import datetime
 from glob import glob
-from array import array
 from imageio import imread, imsave
-import struct
+
+# Use this if you're using PlaidML as your backend
+os.environ["KERAS_BACKEND"] = "plaidml.keras.backend"
 
 from keras.layers import Dropout, Concatenate, Input
 from keras.layers.convolutional import Conv2D, UpSampling2D
@@ -69,7 +70,7 @@ def build_generator(img_shape, _filter_depth, _num_layers, num_channels=3):
     for ll in range(_num_layers - 1):
         # Remove depth to filters as we upsample
         filt_size = min(2 ** (_num_layers - 2 - ll), 8) * _filter_depth
-        new_layer = deconv_2d_layer(new_layer, down_layers[-2 - ll], filt_size, dropout=0.2)
+        new_layer = deconv_2d_layer(new_layer, down_layers[-2 - ll], filt_size)
     # Drop the normalization and skip input on the last step
     new_layer = UpSampling2D(size=2)(new_layer)
     # Stride 1 and same padding keep the output the same size
@@ -145,7 +146,7 @@ def create_networks(_cond_img_shape, _targ_img_shape, _filter_depth, _num_layers
     _discriminator.trainable = False
     fake_output = _discriminator([fake_input, cond_input])
     _combined = Model(inputs=[targ_input, cond_input], outputs=[fake_output, fake_input])
-    _combined.compile(loss=['mse', 'mae'], loss_weights=[1, 100], optimizer=optimizer)
+    _combined.compile(loss=['mse', 'mae'], loss_weights=[1, 10], optimizer=optimizer)
 
     return _combined, _generator, _discriminator
 
@@ -159,6 +160,20 @@ def get_image_files(directory, _batch_size):
     num_batches = int(np.floor(num_samples / _batch_size))
 
     return _cond_files, _targ_files, num_samples, num_batches
+
+
+def load_image_batch(_cond_files, _targ_files, _indexes, _image_size):
+    _batch_size = len(_indexes)
+
+    cond_batch = np.zeros((_batch_size, _image_size, _image_size, 1))  # BW photos have 1 channel
+    targ_batch = np.zeros((_batch_size, _image_size, _image_size, 3))  # Color photos have 3 channels
+
+    for idx in range(len(_indexes)):
+        img_idx = _indexes[idx]
+        cond_batch[idx, :, :, 0] = imread(_cond_files[img_idx]) / 255.0
+        targ_batch[idx, :, :, :] = imread(_targ_files[img_idx]) / 255.0
+
+    return cond_batch, targ_batch
 
 
 def load_image_batch_rb(_cond_files, _targ_files, _indexes, _image_size):
@@ -224,13 +239,32 @@ def train_networks(_combined, _generator, _discriminator, _directory,
                                                                                                   gen_loss[0],
                                                                                                   time_elapsed))
 
-            # If at save interval => save generated image samples
-            if batch % 2000 == 0:
-                generate_samples(generator, epoch, cond_batch[0:8], targ_batch[0:8])
+            if epoch % 10 == 0:
+                save_models(_combined, _generator, _discriminator, epoch)
+
+            # Save some samples after every epoch
+            generate_samples(generator, epoch, cond_batch[0:8], targ_batch[0:8])
+
+
+def save_models(_combined, _generator, _discriminator, _epoch):
+    _combined_json = _combined.to_json()
+    with open("combined_%d.json" % (_epoch), "w") as _json_file:
+        _json_file.write(_combined_json)
+    _combined.save_weights("combined_%d.h5" % (_epoch))
+
+    _discriminator_json = _discriminator.to_json()
+    with open("discriminator_%d.json" % (_epoch), "w") as _json_file:
+        _json_file.write(_discriminator_json)
+    _discriminator.save_weights("discriminator_%d.h5" % (_epoch))
+
+    _generator_json = generator.to_json()
+    with open("generator_%d.json" % (_epoch), "w") as _json_file:
+        _json_file.write(_generator_json)
+    _generator.save_weights("generator_%d.h5" % (_epoch))
 
 
 def post_process_samples_rb(cond_samples, fake_samples, targ_samples):
-    # Y = 0.2126R + 0.7152G + 0.0722B
+    # Y= 0.2126R+ 0.7152G+ 0.0722B
     # Apply inverse HSV to find blue channel on fake and target samples
     fake_samples_g = (cond_samples[:, :, :, 0] -
                       0.2126*fake_samples[:, :, :, 0] -
@@ -241,10 +275,25 @@ def post_process_samples_rb(cond_samples, fake_samples, targ_samples):
     # Extend cond_samples to create "grayscale" RGB image
     cond_samples = cond_samples.repeat(3, axis=3)
 
-    # Generate composite image of three samples
     composite_images = np.concatenate([cond_samples, fake_samples, targ_samples], axis=2)
     np.multiply(composite_images, 255.0, out=composite_images)
-    # Convert from [0.0-1.0] to UINT8 [0-255]
+    composite_images = np.maximum(composite_images, 0.0)
+    composite_images = np.minimum(composite_images, 255.0)
+    # Convert from [0-1] to UINT8 [0-255]
+    composite_images = composite_images.astype('uint8', copy=False)
+
+    return composite_images
+
+
+def post_process_samples(cond_samples, fake_samples, targ_samples):
+    cond_shape = cond_samples.shape
+    cond_samples = cond_samples.repeat(3, axis=len(cond_shape)-1)
+
+    composite_images = np.concatenate([cond_samples, fake_samples, targ_samples], axis=2)
+    np.multiply(composite_images, 255.0, out=composite_images)
+    composite_images = np.maximum(composite_images, 0.0)
+    composite_images = np.minimum(composite_images, 255.0)
+    # Convert from [0-1] to UINT8 [0-255]
     composite_images = composite_images.astype('uint8', copy=False)
 
     return composite_images
@@ -254,6 +303,7 @@ def generate_samples(_generator, prefix, cond_samples, targ_samples):
     os.makedirs('outputs', exist_ok=True)
     fake_samples = _generator.predict(cond_samples)
 
+    # composite_images = post_process_samples(cond_samples, fake_samples, targ_samples)
     composite_images = post_process_samples_rb(cond_samples, fake_samples, targ_samples)
 
     for idx in range(len(composite_images)):
@@ -261,20 +311,10 @@ def generate_samples(_generator, prefix, cond_samples, targ_samples):
 
 
 if __name__ == "__main__":
-    """
-    These parameters are temporary values for use with the MNIST digit database
-
-    This test will attempt to train the generator to invert the colors on the digits
-    """
-    """ MNIST Training
-    img_shape = (28, 28, 1)
-    filter_depth = 12
-    num_layers = 2
-    """
     cond_img_shape = (256, 256, 1)
     targ_img_shape = (256, 256, 2)
     filter_depth = 64
-    num_layers = 7
+    num_layers = 6
     num_epochs = 200
     batch_size = 10
 
@@ -288,7 +328,7 @@ if __name__ == "__main__":
     print(combined.summary())
 
     # Train and save the networks
-    train_networks(combined, generator, discriminator, './bird_med',
+    train_networks(combined, generator, discriminator, './bird',
                    targ_img_shape[0], targ_img_shape[2], num_epochs, batch_size)
 
     combined_json = combined.to_json()
